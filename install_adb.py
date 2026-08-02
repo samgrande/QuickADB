@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import subprocess
@@ -125,7 +126,7 @@ LOGO_MEDIUM_W = max(len(l) for l in LOGO_MEDIUM)
 
 LOGO_TAGLINE = "system-wide adb / fastboot installer"
 LOGO_BYLINE = "by HeX"
-LOGO_TOP_MARGIN = 4  # blank lines above the logo — bump this to push it down further
+LOGO_TOP_MARGIN = 1  # blank lines above the logo — bump this to push it down further
 
 
 def _center(line, width):
@@ -236,6 +237,59 @@ def _pad_row(plain_text, colored_text=None, width=None):
     return f"|{plain_text}{' ' * pad}|"
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _vlen(s):
+    """Visible length of a string, ignoring ANSI escape codes — needed so
+    centering/padding math is based on what actually appears on screen."""
+    return len(_ANSI_RE.sub("", s))
+
+
+def _ctr(s, width):
+    """Center a (possibly ANSI-colored) string within `width` columns,
+    padding based on *visible* length so escape codes never throw the
+    alignment off."""
+    pad = max(width - _vlen(s), 0)
+    left = pad // 2
+    return " " * left + s + " " * (pad - left)
+
+
+# ----------------------------------------------------------------------
+# Rounded "card" panel — the one modern building block the full-screen
+# TUI is built from. The menu screen and the action/progress screen are
+# both just a card with different content, always centered on screen.
+# ----------------------------------------------------------------------
+def _card_width(cols):
+    return max(min(64, cols - 6), min(24, cols - 2))
+
+
+def _card_top(w):
+    return _c(f"╭{'─' * (w - 2)}╮", C.DROID_DIM)
+
+
+def _card_bottom(w):
+    return _c(f"╰{'─' * (w - 2)}╯", C.DROID_DIM)
+
+
+def _card_divider(w):
+    return _c(f"├{'─' * (w - 2)}┤", C.DROID_DIM)
+
+
+def _card_row(content, w, center=False):
+    """One row of card content, padded/truncated to fit inside the
+    border. `content` may already contain ANSI color codes."""
+    inner_w = max(w - 4, 1)
+    if _vlen(content) > inner_w:
+        content = _ANSI_RE.sub("", content)[:max(inner_w - 1, 1)] + "…"
+    if center:
+        content = _ctr(content, inner_w)
+    else:
+        content = content + " " * max(inner_w - _vlen(content), 0)
+    border = _c("│", C.DROID_DIM)
+    return f"{border} {content} {border}"
+
+
 def box_top():
     w = box_width()
     return f"{C.DIM}┌{'─' * w}┐{C.RESET}" if USE_COLOR else "+" + "-" * w + "+"
@@ -285,20 +339,71 @@ def hr(char="─", width=None, color=C.DIM):
     print(_c(char * width, color))
 
 
+# ----------------------------------------------------------------------
+# In-TUI activity log + progress state.
+#
+# When an action screen (install/update/uninstall) is running inside the
+# full-screen alt-buffer, log()/success()/warn()/error() calls made deep
+# inside do_install() etc. get redirected here instead of printed
+# directly — so the same code path drives both the plain CLI output and
+# the live in-TUI card, without do_install() needing to know which mode
+# it's running in.
+# ----------------------------------------------------------------------
+_tui_active = False
+_tui_log_lines = []   # list of (text, kind)
+_tui_progress = None  # (done, total) or None
+_tui_redraw = None    # callable, set while an action screen is live
+
+_KIND_STYLE = {
+    "info": (C.DROID, "›"),
+    "success": (C.DROID, GLYPH_SUCCESS),
+    "warn": (C.SOFT_YELLOW, GLYPH_WARN),
+    "error": (C.SOFT_RED, GLYPH_ERROR),
+    "detail": (C.DIM, " "),
+}
+
+
+def _tui_push(text, kind="info"):
+    _tui_log_lines.append((text, kind))
+    del _tui_log_lines[:-6]  # keep the card compact — most recent lines only
+    if _tui_redraw:
+        _tui_redraw()
+
+
 def log(msg):
+    if _tui_active:
+        _tui_push(msg, "info")
+        return
     print(f"{_c('›', C.DROID)} {msg}")
 
 
 def success(msg):
+    if _tui_active:
+        _tui_push(msg, "success")
+        return
     print(f"{_c(GLYPH_SUCCESS, C.DROID)} {msg}")
 
 
 def warn(msg):
+    if _tui_active:
+        _tui_push(msg, "warn")
+        return
     print(f"{_c(GLYPH_WARN, C.SOFT_YELLOW)} {msg}")
 
 
 def error(msg):
+    if _tui_active:
+        _tui_push(msg, "error")
+        return
     print(f"{_c(GLYPH_ERROR, C.SOFT_RED)} {msg}")
+
+
+def detail(msg):
+    """Secondary/dim output, e.g. the verbatim adb version string."""
+    if _tui_active:
+        _tui_push(msg, "detail")
+        return
+    print(_c(f"    {msg}", C.DIM))
 
 
 # ----------------------------------------------------------------------
@@ -407,7 +512,9 @@ def detect_existing_install(system):
 # ----------------------------------------------------------------------
 # Download / extract
 # ----------------------------------------------------------------------
-def _print_progress_bar(done, total, width=32):
+def _progress_bar_str(done, total, width=32):
+    """Build just the colored bar+percentage text (no cursor control) —
+    shared by the plain \\r-updating CLI output and the in-TUI card."""
     if total > 0:
         frac = min(done / total, 1.0)
         filled = int(width * frac)
@@ -415,10 +522,19 @@ def _print_progress_bar(done, total, width=32):
         pct = f"{frac * 100:5.1f}%"
         mb_done = done / (1024 * 1024)
         mb_total = total / (1024 * 1024)
-        line = f"  {_c(bar, C.DROID)} {pct}  ({mb_done:.1f}/{mb_total:.1f} MB)"
-    else:
-        mb_done = done / (1024 * 1024)
-        line = f"  downloading... {mb_done:.1f} MB"
+        return f"{_c(bar, C.DROID)} {pct}  ({mb_done:.1f}/{mb_total:.1f} MB)"
+    mb_done = done / (1024 * 1024)
+    return f"downloading… {mb_done:.1f} MB"
+
+
+def _print_progress_bar(done, total, width=32):
+    global _tui_progress
+    if _tui_active:
+        _tui_progress = (done, total)
+        if _tui_redraw:
+            _tui_redraw()
+        return
+    line = "  " + _progress_bar_str(done, total, width=width)
     sys.stdout.write("\r" + line + " " * 8)
     sys.stdout.flush()
 
@@ -438,7 +554,8 @@ def download_platform_tools(system, dest_zip):
                 out.write(chunk)
                 downloaded += len(chunk)
                 _print_progress_bar(downloaded, total)
-    print()
+    if not _tui_active:
+        print()
     success(f"Downloaded to {dest_zip}")
 
 
@@ -610,7 +727,7 @@ def verify_adb(adb_path):
     try:
         out = subprocess.run([adb_path, "version"], capture_output=True, text=True, timeout=10)
         success("adb is working:")
-        print(_c(f"    {out.stdout.strip()}", C.DIM))
+        detail(out.stdout.strip())
     except Exception as e:
         warn(f"Could not run adb to verify install: {e}")
 
@@ -773,6 +890,28 @@ def status_lines(system, state):
     return [colored if USE_COLOR else plain for plain, colored in lines]
 
 
+def status_card_lines(system, state):
+    """Status content for the modern centered card inside the TUI (as
+    opposed to status_lines(), which renders the plain left-aligned
+    --status panel)."""
+    lines = []
+    if state["installed"]:
+        badge = f"{GLYPH_OK} INSTALLED"
+        lines.append(f"{C.DROID}{C.BOLD}{badge}{C.RESET}" if USE_COLOR else badge)
+        managed_note = "managed by Quick ADB" if state["managed"] else "found on PATH — not managed by Quick ADB"
+        lines.append(_c(managed_note, C.DIM))
+        lines.append("")
+        lines.append(f"{_c('Location', C.DROID)}  {state['dir']}")
+        lines.append(f"{_c('Version', C.DROID)}   {state['version'] or 'unknown'}")
+        lines.append(f"{_c('Platform', C.DROID)}  {system}")
+    else:
+        badge = f"{GLYPH_EMPTY} NOT INSTALLED"
+        lines.append(f"{C.SOFT_RED}{C.BOLD}{badge}{C.RESET}" if USE_COLOR else badge)
+        lines.append("")
+        lines.append(f"{_c('Platform', C.DROID)}  {system}")
+    return lines
+
+
 def print_status(system, state):
     hr()
     for line in status_lines(system, state):
@@ -802,16 +941,19 @@ def build_options(state):
 
 def dispatch_choice(system, choice, state):
     if choice == "update":
-        do_update(system)
+        run_action_screen(system, "Updating platform-tools", lambda: do_update(system))
     elif choice in ("reinstall_default", "install_default"):
-        do_install(system, DEFAULT_DIR[system])
+        run_action_screen(system, "Installing platform-tools",
+                           lambda: do_install(system, DEFAULT_DIR[system]))
     elif choice in ("reinstall_custom", "install_custom"):
         custom = input(_c("  Enter full install path: ", C.BOLD)).strip()
         if custom:
-            do_install(system, custom)
+            run_action_screen(system, "Installing platform-tools",
+                               lambda: do_install(system, custom))
     elif choice == "uninstall":
         if confirm_select(prompt=f"Uninstall adb from {state['dir']}?"):
-            do_uninstall(system)
+            run_action_screen(system, "Uninstalling platform-tools",
+                               lambda: do_uninstall(system))
         else:
             log("Cancelled.")
 
@@ -856,21 +998,24 @@ def _menu_header(cols, rows):
 
 def _menu_frame(system, state, options, idx):
     cols, rows = screen_width(), screen_height()
-    w = max(cols - 4, 20)  # content divider/text width, small side margin
-
     header = _menu_header(cols, rows)
+    w = _card_width(cols)
 
-    content = []
-    content.extend("  " + l if not l.startswith(" ") else l for l in status_lines(system, state))
-    content.append(_c("  " + "─" * w, C.DIM))
-    content.append("")
-    content.append(_c("  Select an action", C.BOLD))
-    content.append("")
+    body = [_card_top(w)]
+    for line in status_card_lines(system, state):
+        body.append(_card_row(line, w, center=True))
+    body.append(_card_divider(w))
+    body.append(_card_row(_c("SELECT AN ACTION", C.BOLD), w, center=True))
+    body.append(_card_row("", w))
     for i, (_, label) in enumerate(options):
         if i == idx:
-            content.append(f"  {_c(GLYPH_POINTER, C.DROID)} {C.BOLD}{C.DROID}{label}{C.RESET}")
+            row = f"{_c(GLYPH_POINTER, C.DROID)} {C.BOLD}{C.DROID}{label}{C.RESET}"
         else:
-            content.append(f"    {_c(label, C.DIM)}")
+            row = _c(label, C.DIM)
+        body.append(_card_row(row, w, center=True))
+    body.append(_card_bottom(w))
+
+    content = [_ctr(l, cols) for l in body]
 
     # Fill the full terminal height: header + content, vertically
     # centered in whatever's left + footer (1), pinned to the very bottom.
@@ -885,6 +1030,101 @@ def _menu_frame(system, state, options, idx):
     lines.extend([""] * bottom_pad)
     lines.append(_hint_bar("↑/k ↓/j move   ↵ select   1-9 jump   q/⎋ quit"))
     return lines
+
+
+def _action_frame(system, title, done):
+    """The live card shown while install/update/uninstall runs: a title,
+    a progress bar (while a download is in flight), and a small scrolling
+    activity log — all centered, all inside the same rounded card style
+    as the menu screen."""
+    cols, rows = screen_width(), screen_height()
+    header = _menu_header(cols, rows)
+    w = _card_width(cols)
+    inner_w = max(w - 4, 1)
+
+    body = [_card_top(w)]
+    body.append(_card_row(f"{C.BOLD}{title}{C.RESET}" if USE_COLOR else title, w, center=True))
+    body.append(_card_row("", w))
+
+    if _tui_progress is not None:
+        bar_width = max(min(32, inner_w - 22), 10)
+        bar = _progress_bar_str(*_tui_progress, width=bar_width)
+        body.append(_card_row(bar, w, center=True))
+        body.append(_card_row("", w))
+
+    if not _tui_log_lines:
+        body.append(_card_row(_c(GLYPH_BUSY + " working...", C.DIM), w, center=True))
+    else:
+        for text, kind in _tui_log_lines:
+            color, glyph = _KIND_STYLE.get(kind, (C.DROID, "›"))
+            row = _c(text, color) if kind == "detail" else f"{_c(glyph, color)} {text}"
+            body.append(_card_row(row, w, center=True))
+
+    body.append(_card_row("", w))
+    if done:
+        body.append(_card_row(f"{_c(GLYPH_SUCCESS, C.DROID)} done", w, center=True))
+    body.append(_card_bottom(w))
+
+    content = [_ctr(l, cols) for l in body]
+
+    available = max(rows - len(header) - 1, 1)
+    extra = max(available - len(content), 0)
+    top_pad = extra // 2
+    bottom_pad = extra - top_pad
+
+    lines = list(header)
+    lines.extend([""] * top_pad)
+    lines.extend(content)
+    lines.extend([""] * bottom_pad)
+    hint = "any key to continue" if done else "please wait..."
+    lines.append(_hint_bar(hint))
+    return lines
+
+
+def run_action_screen(system, title, action_fn):
+    """Runs `action_fn` (do_install / do_update / do_uninstall) inside its
+    own full-screen alt-buffer session with a live-updating card: a
+    progress bar while downloading, and a scrolling activity log — so
+    install/update/uninstall never dumps back to plain scrolling text.
+    Waits for a keypress once finished, then restores the normal screen."""
+    global _tui_active, _tui_log_lines, _tui_progress, _tui_redraw, _active_frame_renderer
+
+    _tui_log_lines = []
+    _tui_progress = None
+    _tui_active = True
+
+    def draw(done=False):
+        frame = _action_frame(system, title, done)
+        sys.stdout.write("\033[H\033[J")
+        sys.stdout.write("\n".join(frame) + "\n")
+        sys.stdout.flush()
+
+    sys.stdout.write("\033[?1049h\033[?25l")
+    _tui_redraw = draw
+    _active_frame_renderer = draw
+    _install_resize_handler()
+    _install_suspend_handler()
+    draw(False)
+
+    try:
+        action_fn()
+    except PrivilegeError as e:
+        error(str(e))
+    except Exception as e:
+        error(f"Unexpected error: {e}")
+    finally:
+        _tui_progress = None
+        draw(True)
+        try:
+            _getch()
+        except KeyboardInterrupt:
+            pass
+        _tui_active = False
+        _tui_redraw = None
+        _active_frame_renderer = None
+        _restore_default_signals()
+        sys.stdout.write("\033[?25h\033[?1049l")
+        sys.stdout.flush()
 
 
 _active_frame_renderer = None  # set while a full-screen frame is on screen,
