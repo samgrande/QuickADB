@@ -948,6 +948,7 @@ def status_card_lines(system, state):
         lines.append(f"{C.DROID}{C.BOLD}{badge}{C.RESET}" if USE_COLOR else badge)
         managed_note = "managed by Quick ADB" if state["managed"] else "found on PATH — not managed by Quick ADB"
         lines.append(_c(managed_note, C.DIM))
+        lines.append("")
         lines.append(f"{_c('Location', C.DROID)}  {state['dir']}")
         lines.append(f"{_c('Version', C.DROID)}   {state['version'] or 'unknown'}")
         lines.append(f"{_c('Platform', C.DROID)}  {system}")
@@ -1044,43 +1045,17 @@ def _hint_bar(hint):
     return text + " " * pad
 
 
-def _logo_header_lines(art, cols, margin=LOGO_TOP_MARGIN):
-    """Build the ascii-art header block for one art tier, centered on
-    `cols` columns: the art rows, tagline, byline, and a divider."""
-    lines = [""] * margin
-    plain = [_center(l, cols) for l in art]
-    plain.append(_center(LOGO_TAGLINE, cols))
-    plain.append(_center(LOGO_BYLINE, cols))
-    lines.extend(colorize_logo(plain, len(art)))
-    lines.append(_c("─" * len(art[0]), C.DROID_DIM))
-    return lines
-
-
-def _logo_header_height(art, margin=LOGO_TOP_MARGIN):
-    return margin + len(art) + 3  # art + tagline + byline + divider
-
-
-def _pick_header(cols, rows, content_h):
-    """Pick the largest header that fits without clipping: prefer the big
-    ascii-art logo, then the compact logo, then the slim title bar. The
-    top margin is dropped if that's what keeps the chosen tier on screen.
-    `content_h` is the number of card lines that share the screen below
-    the header (plus the pinned footer bar)."""
-    footer = 1
-    space = rows - content_h - footer
-    for art in (LOGO_LARGE, LOGO_MEDIUM):
-        if cols < len(art[0]) + 4:
-            continue
-        base_h = _logo_header_height(art, margin=0)
-        if space >= base_h + LOGO_TOP_MARGIN:
-            return _logo_header_lines(art, cols, margin=LOGO_TOP_MARGIN)
-        if space >= base_h:
-            return _logo_header_lines(art, cols, margin=0)
+def _menu_header(cols, rows):
+    """Simple banner strip pinned to the top of every full-screen frame
+    (menu, action, input, confirm, notice) — always just the title bar, so
+    the card below it is never pushed off or clipped regardless of how
+    small the terminal is."""
     return [_title_bar()]
 
 
 def _menu_frame(system, state, options, idx):
     cols, rows = screen_width(), screen_height()
+    header = _menu_header(cols, rows)
     w = _card_width(cols)
 
     body = [_card_top(w)]
@@ -1088,6 +1063,7 @@ def _menu_frame(system, state, options, idx):
         body.append(_card_row(line, w, center=True))
     body.append(_card_divider(w))
     body.append(_card_row(_c("SELECT AN ACTION", C.BOLD), w, center=True))
+    body.append(_card_row("", w))
     for i, (_, label) in enumerate(options):
         if i == idx:
             row = f"{_c(GLYPH_POINTER, C.DROID)} {C.BOLD}{C.DROID}{label}{C.RESET}"
@@ -1097,7 +1073,6 @@ def _menu_frame(system, state, options, idx):
     body.append(_card_bottom(w))
 
     content = [_ctr(l, cols) for l in body]
-    header = _pick_header(cols, rows, len(content))
 
     # Fill the full terminal height: header + content, vertically
     # centered in whatever's left + footer (1), pinned to the very bottom.
@@ -1120,6 +1095,7 @@ def _action_frame(system, title, done):
     activity log — all centered, all inside the same rounded card style
     as the menu screen."""
     cols, rows = screen_width(), screen_height()
+    header = _menu_header(cols, rows)
     w = _card_width(cols)
     inner_w = max(w - 4, 1)
 
@@ -1147,7 +1123,6 @@ def _action_frame(system, title, done):
     body.append(_card_bottom(w))
 
     content = [_ctr(l, cols) for l in body]
-    header = _pick_header(cols, rows, len(content))
 
     available = max(rows - len(header) - 1, 1)
     extra = max(available - len(content), 0)
@@ -1360,6 +1335,7 @@ def _input_field_row(value, cursor, w):
 
 def _input_frame(system, title, prompt, value, cursor):
     cols, rows = screen_width(), screen_height()
+    header = _menu_header(cols, rows)
     w = _card_width(cols)
 
     body = [_card_top(w)]
@@ -1373,7 +1349,6 @@ def _input_frame(system, title, prompt, value, cursor):
     body.append(_card_bottom(w))
 
     content = [_ctr(l, cols) for l in body]
-    header = _pick_header(cols, rows, len(content))
     available = max(rows - len(header) - 1, 1)
     extra = max(available - len(content), 0)
     top_pad = extra // 2
@@ -1436,6 +1411,7 @@ def run_input_screen(system, title, prompt, initial=""):
 
 def _confirm_frame(system, prompt, idx):
     cols, rows = screen_width(), screen_height()
+    header = _menu_header(cols, rows)
     w = _card_width(cols)
     options = [("no", "No, cancel"), ("yes", "Yes, continue")]
 
@@ -1451,7 +1427,6 @@ def _confirm_frame(system, prompt, idx):
     body.append(_card_bottom(w))
 
     content = [_ctr(l, cols) for l in body]
-    header = _pick_header(cols, rows, len(content))
     available = max(rows - len(header) - 1, 1)
     extra = max(available - len(content), 0)
     top_pad = extra // 2
@@ -1504,6 +1479,7 @@ def run_confirm_screen(system, prompt):
 
 def _notice_frame(system, title, lines):
     cols, rows = screen_width(), screen_height()
+    header = _menu_header(cols, rows)
     w = _card_width(cols)
 
     body = [_card_top(w)]
@@ -1516,7 +1492,6 @@ def _notice_frame(system, title, lines):
     body.append(_card_bottom(w))
 
     content = [_ctr(l, cols) for l in body]
-    header = _pick_header(cols, rows, len(content))
     available = max(rows - len(header) - 1, 1)
     extra = max(available - len(content), 0)
     top_pad = extra // 2
