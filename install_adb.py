@@ -751,15 +751,73 @@ def _supports_raw_input():
         return False
 
 
+_raw_mode = False            # True while a screen holds the terminal in raw mode
+_raw_old_settings = None
+
+
+def _read_raw_char():
+    """Read one keypress from a terminal that is already in raw mode.
+    Distinguishes an escape sequence (arrow keys) from a lone ESC with a
+    short peek timeout, so pressing ESC alone never blocks on a second
+    read."""
+    fd = sys.stdin.fileno()
+    ch = os.read(fd, 1)
+    if ch == b"\x1b":
+        import select as _select
+        ready, _, _ = _select.select([fd], [], [], 0.05)
+        if ready:
+            ch2 = os.read(fd, 1)
+            if ch2 == b"[":
+                ch3 = os.read(fd, 1)
+                if ch3:
+                    return {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}.get(ch3.decode(errors="ignore"), "ESC")
+                return "ESC"
+            return "ESC"
+        return "ESC"
+    if ch in (b"\r", b"\n"):
+        return "ENTER"
+    if ch == b"\x03":
+        raise KeyboardInterrupt
+    return ch.decode(errors="ignore")
+
+
+def _raw_enter():
+    """Hold the terminal in raw mode for the whole lifetime of a screen,
+    so fast typing and pasted input aren't mangled by per-keystroke
+    mode toggling. Idempotent; no-op on Windows (msvcrt handles it)."""
+    global _raw_mode, _raw_old_settings
+    if _raw_mode or platform.system() == "Windows":
+        return
+    import termios, tty
+    fd = sys.stdin.fileno()
+    _raw_old_settings = termios.tcgetattr(fd)
+    tty.setraw(fd)
+    _raw_mode = True
+
+
+def _raw_leave():
+    """Restore the terminal from raw mode (paired with _raw_enter)."""
+    global _raw_mode, _raw_old_settings
+    if not _raw_mode or platform.system() == "Windows":
+        return
+    import termios
+    fd = sys.stdin.fileno()
+    termios.tcsetattr(fd, termios.TCSADRAIN, _raw_old_settings)
+    _raw_old_settings = None
+    _raw_mode = False
+
+
 def _getch():
-    """Read one keypress, returning 'UP', 'DOWN', 'ENTER', 'ESC', a single
-    printable character, or None for anything unrecognized."""
+    """Read one keypress, returning 'UP', 'DOWN', 'LEFT', 'RIGHT',
+    'ENTER', 'ESC', a single printable character, or None for anything
+    unrecognized. Uses an active raw-mode session if one is held by the
+    current screen, otherwise manages raw mode for this single read."""
     if platform.system() == "Windows":
         import msvcrt
         ch = msvcrt.getch()
         if ch in (b"\x00", b"\xe0"):  # arrow / function key prefix
             ch2 = msvcrt.getch()
-            return {"H": "UP", "P": "DOWN"}.get(ch2.decode(errors="ignore"))
+            return {"H": "UP", "P": "DOWN", "K": "LEFT", "M": "RIGHT"}.get(ch2.decode(errors="ignore"))
         if ch in (b"\r", b"\n"):
             return "ENTER"
         if ch == b"\x03":
@@ -770,26 +828,16 @@ def _getch():
             return ch.decode()
         except Exception:
             return None
-    else:
-        import termios, tty
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd)
-            ch = sys.stdin.read(1)
-            if ch == "\x1b":
-                ch2 = sys.stdin.read(1)
-                if ch2 == "[":
-                    ch3 = sys.stdin.read(1)
-                    return {"A": "UP", "B": "DOWN"}.get(ch3, "ESC")
-                return "ESC"
-            if ch in ("\r", "\n"):
-                return "ENTER"
-            if ch == "\x03":
-                raise KeyboardInterrupt
-            return ch
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    if _raw_mode:
+        return _read_raw_char()
+    import termios, tty
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        return _read_raw_char()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
 # ----------------------------------------------------------------------
@@ -939,22 +987,38 @@ def build_options(state):
     ]
 
 
-def dispatch_choice(system, choice, state):
+def dispatch_choice(system, choice, state, tui=False):
     if choice == "update":
-        run_action_screen(system, "Updating platform-tools", lambda: do_update(system))
+        run_action_screen(system, "Updating platform-tools", lambda: do_update(system), persistent=tui)
     elif choice in ("reinstall_default", "install_default"):
         run_action_screen(system, "Installing platform-tools",
-                           lambda: do_install(system, DEFAULT_DIR[system]))
+                           lambda: do_install(system, DEFAULT_DIR[system]), persistent=tui)
     elif choice in ("reinstall_custom", "install_custom"):
-        custom = input(_c("  Enter full install path: ", C.BOLD)).strip()
-        if custom:
+        if tui:
+            custom = run_input_screen(
+                system,
+                "Custom install location",
+                f"Full path to install into (default: {DEFAULT_DIR[system]}):",
+                initial=DEFAULT_DIR[system],
+            )
+            if custom is None or not custom.strip():
+                return
             run_action_screen(system, "Installing platform-tools",
-                               lambda: do_install(system, custom))
-    elif choice == "uninstall":
-        if confirm_select(prompt=f"Uninstall adb from {state['dir']}?"):
-            run_action_screen(system, "Uninstalling platform-tools",
-                               lambda: do_uninstall(system))
+                              lambda: do_install(system, custom.strip()), persistent=tui)
         else:
+            custom = input(_c("  Enter full install path: ", C.BOLD)).strip()
+            if custom:
+                run_action_screen(system, "Installing platform-tools",
+                                  lambda: do_install(system, custom))
+    elif choice == "uninstall":
+        if tui:
+            confirmed = run_confirm_screen(system, f"Uninstall adb from {state['dir']}?")
+        else:
+            confirmed = confirm_select(prompt=f"Uninstall adb from {state['dir']}?")
+        if confirmed:
+            run_action_screen(system, "Uninstalling platform-tools",
+                              lambda: do_uninstall(system), persistent=tui)
+        elif not tui:
             log("Cancelled.")
 
 
@@ -1081,12 +1145,14 @@ def _action_frame(system, title, done):
     return lines
 
 
-def run_action_screen(system, title, action_fn):
+def run_action_screen(system, title, action_fn, persistent=False):
     """Runs `action_fn` (do_install / do_update / do_uninstall) inside its
     own full-screen alt-buffer session with a live-updating card: a
     progress bar while downloading, and a scrolling activity log — so
     install/update/uninstall never dumps back to plain scrolling text.
-    Waits for a keypress once finished, then restores the normal screen."""
+    Waits for a keypress once finished, then restores the normal screen.
+    When `persistent` is True the caller already owns the alt buffer, so
+    this screen only draws into it and never enters/leaves it."""
     global _tui_active, _tui_log_lines, _tui_progress, _tui_redraw, _active_frame_renderer
 
     _tui_log_lines = []
@@ -1099,14 +1165,15 @@ def run_action_screen(system, title, action_fn):
         sys.stdout.write("\n".join(frame) + "\n")
         sys.stdout.flush()
 
-    sys.stdout.write("\033[?1049h\033[?25l")
+    if not persistent:
+        _buffer_enter()
     _tui_redraw = draw
     _active_frame_renderer = draw
     _install_resize_handler()
     _install_suspend_handler()
-    draw(False)
-
+    _raw_enter()
     try:
+        draw(False)
         action_fn()
     except PrivilegeError as e:
         error(str(e))
@@ -1119,16 +1186,41 @@ def run_action_screen(system, title, action_fn):
             _getch()
         except KeyboardInterrupt:
             pass
+        _raw_leave()
         _tui_active = False
         _tui_redraw = None
         _active_frame_renderer = None
         _restore_default_signals()
-        sys.stdout.write("\033[?25h\033[?1049l")
-        sys.stdout.flush()
+        if not persistent:
+            _buffer_leave()
 
 
 _active_frame_renderer = None  # set while a full-screen frame is on screen,
                                 # so SIGWINCH can trigger an immediate redraw
+
+_tui_in_buffer = False  # True while the alternate screen buffer is active
+
+
+def _buffer_enter():
+    """Enter the alternate screen buffer (idempotent — safe to call when
+    it's already active)."""
+    global _tui_in_buffer
+    if _tui_in_buffer:
+        return
+    sys.stdout.write("\033[?1049h\033[?25l")
+    sys.stdout.flush()
+    _tui_in_buffer = True
+
+
+def _buffer_leave():
+    """Leave the alternate screen buffer and restore the cursor
+    (idempotent)."""
+    global _tui_in_buffer
+    if not _tui_in_buffer:
+        return
+    sys.stdout.write("\033[?25h\033[?1049l")
+    sys.stdout.flush()
+    _tui_in_buffer = False
 
 
 def _install_resize_handler():
@@ -1181,10 +1273,10 @@ def _restore_default_signals():
                 pass
 
 
-def run_menu_screen(system, state, options):
+def run_menu_screen(system, state, options, persistent=False):
     """Full-screen (alt-buffer) picker. Returns the chosen option key.
-    Restores the normal screen buffer before returning so subsequent
-    log/success/etc. output scrolls normally."""
+    If `persistent`, assumes the alt buffer is already active (managed by
+    the caller) and only draws — it never enters/leaves the buffer."""
     global _active_frame_renderer
     n = len(options)
     idx = 0
@@ -1195,11 +1287,12 @@ def run_menu_screen(system, state, options):
         sys.stdout.write("\n".join(frame) + "\n")
         sys.stdout.flush()
 
-    sys.stdout.write("\033[?1049h")  # enter alternate screen buffer
-    sys.stdout.write("\033[?25l")    # hide cursor
+    if not persistent:
+        _buffer_enter()
     _active_frame_renderer = draw
     _install_resize_handler()
     _install_suspend_handler()
+    _raw_enter()
     try:
         while True:
             draw()
@@ -1220,13 +1313,229 @@ def run_menu_screen(system, state, options):
                 idx = int(key) - 1
                 break
     finally:
+        _raw_leave()
         _active_frame_renderer = None
         _restore_default_signals()
-        sys.stdout.write("\033[?25h")    # show cursor
-        sys.stdout.write("\033[?1049l")  # leave alternate screen buffer
-        sys.stdout.flush()
+        if not persistent:
+            _buffer_leave()
 
     return options[idx][0]
+
+
+# ----------------------------------------------------------------------
+# In-TUI input / confirm / notice screens — everything a selection can
+# lead to happens *inside* the alt-buffer TUI, so the shell prompt never
+# reappears until Exit is chosen.
+# ----------------------------------------------------------------------
+def _input_field_row(value, cursor, w):
+    """The editable field row: the value with a block cursor ('▌') at the
+    cursor position, left-aligned and windowed so the cursor always stays
+    visible even for very long paths."""
+    inner_w = max(w - 4, 1)
+    marker = value[:cursor] + "▌" + value[cursor:]
+    if len(marker) > inner_w:
+        start = max(0, cursor + 1 - inner_w)
+        marker = marker[start:start + inner_w]
+    border = _c("│", C.DROID_DIM)
+    return f"{border} {_c(marker, C.BOLD)}{' ' * max(inner_w - len(marker), 0)} {border}"
+
+
+def _input_frame(system, title, prompt, value, cursor):
+    cols, rows = screen_width(), screen_height()
+    header = _menu_header(cols, rows)
+    w = _card_width(cols)
+
+    body = [_card_top(w)]
+    body.append(_card_row(_c(title, C.BOLD), w, center=True))
+    body.append(_card_row("", w))
+    body.append(_card_row(_c(prompt, C.DIM), w, center=True))
+    body.append(_card_row("", w))
+    body.append(_input_field_row(value, cursor, w))
+    body.append(_card_row("", w))
+    body.append(_card_row(_c("↵ confirm   ⎋ cancel", C.DIM), w, center=True))
+    body.append(_card_bottom(w))
+
+    content = [_ctr(l, cols) for l in body]
+    available = max(rows - len(header) - 1, 1)
+    extra = max(available - len(content), 0)
+    top_pad = extra // 2
+    bottom_pad = extra - top_pad
+
+    lines = list(header)
+    lines.extend([""] * top_pad)
+    lines.extend(content)
+    lines.extend([""] * bottom_pad)
+    lines.append(_hint_bar("type to edit   ←/→ move   ↵ confirm   ⎋ cancel"))
+    return lines
+
+
+def run_input_screen(system, title, prompt, initial=""):
+    """Full-screen card with an editable text field. Returns the entered
+    text, or None if the user cancelled with ESC."""
+    global _active_frame_renderer
+    buf = list(initial)
+    cursor = len(buf)
+
+    def draw():
+        frame = _input_frame(system, title, prompt, "".join(buf), cursor)
+        sys.stdout.write("\033[H\033[J")
+        sys.stdout.write("\n".join(frame) + "\n")
+        sys.stdout.flush()
+
+    _active_frame_renderer = draw
+    _install_resize_handler()
+    _install_suspend_handler()
+    _raw_enter()
+    try:
+        while True:
+            draw()
+            key = _getch()
+            if key == "ENTER":
+                break
+            if key == "ESC":
+                return None
+            if key in ("\x7f", "\b"):
+                if cursor > 0:
+                    del buf[cursor - 1]
+                    cursor -= 1
+            elif key == "LEFT":
+                cursor = max(0, cursor - 1)
+            elif key == "RIGHT":
+                cursor = min(len(buf), cursor + 1)
+            elif key == "UP":
+                cursor = 0
+            elif key == "DOWN":
+                cursor = len(buf)
+            elif key and key.isprintable() and len(key) == 1:
+                buf.insert(cursor, key)
+                cursor += 1
+    finally:
+        _raw_leave()
+        _active_frame_renderer = None
+        _restore_default_signals()
+    return "".join(buf)
+
+
+def _confirm_frame(system, prompt, idx):
+    cols, rows = screen_width(), screen_height()
+    header = _menu_header(cols, rows)
+    w = _card_width(cols)
+    options = [("no", "No, cancel"), ("yes", "Yes, continue")]
+
+    body = [_card_top(w)]
+    body.append(_card_row(_c(prompt, C.BOLD), w, center=True))
+    body.append(_card_row("", w))
+    for i, (_, label) in enumerate(options):
+        if i == idx:
+            row = f"{_c(GLYPH_POINTER, C.DROID)} {C.BOLD}{C.DROID}{label}{C.RESET}"
+        else:
+            row = _c(label, C.DIM)
+        body.append(_card_row(row, w, center=True))
+    body.append(_card_bottom(w))
+
+    content = [_ctr(l, cols) for l in body]
+    available = max(rows - len(header) - 1, 1)
+    extra = max(available - len(content), 0)
+    top_pad = extra // 2
+    bottom_pad = extra - top_pad
+
+    lines = list(header)
+    lines.extend([""] * top_pad)
+    lines.extend(content)
+    lines.extend([""] * bottom_pad)
+    lines.append(_hint_bar("↑/k ↓/j move   ↵ select   ⎋ cancel"))
+    return lines
+
+
+def run_confirm_screen(system, prompt):
+    """Full-screen yes/no confirmation inside the TUI. Returns True only
+    if the user explicitly picks 'Yes, continue'."""
+    global _active_frame_renderer
+    options = [("no", "No, cancel"), ("yes", "Yes, continue")]
+    n = len(options)
+    idx = 0
+
+    def draw():
+        frame = _confirm_frame(system, prompt, idx)
+        sys.stdout.write("\033[H\033[J")
+        sys.stdout.write("\n".join(frame) + "\n")
+        sys.stdout.flush()
+
+    _active_frame_renderer = draw
+    _install_resize_handler()
+    _install_suspend_handler()
+    _raw_enter()
+    try:
+        while True:
+            draw()
+            key = _getch()
+            if key in ("UP", "k"):
+                idx = (idx - 1) % n
+            elif key in ("DOWN", "j"):
+                idx = (idx + 1) % n
+            elif key == "ENTER":
+                break
+            elif key == "ESC":
+                return False
+    finally:
+        _raw_leave()
+        _active_frame_renderer = None
+        _restore_default_signals()
+    return options[idx][0] == "yes"
+
+
+def _notice_frame(system, title, lines):
+    cols, rows = screen_width(), screen_height()
+    header = _menu_header(cols, rows)
+    w = _card_width(cols)
+
+    body = [_card_top(w)]
+    body.append(_card_row(_c(title, C.BOLD), w, center=True))
+    body.append(_card_row("", w))
+    for line in lines:
+        body.append(_card_row(line, w, center=True))
+    body.append(_card_row("", w))
+    body.append(_card_row(_c("any key to continue", C.DIM), w, center=True))
+    body.append(_card_bottom(w))
+
+    content = [_ctr(l, cols) for l in body]
+    available = max(rows - len(header) - 1, 1)
+    extra = max(available - len(content), 0)
+    top_pad = extra // 2
+    bottom_pad = extra - top_pad
+
+    frame = list(header)
+    frame.extend([""] * top_pad)
+    frame.extend(content)
+    frame.extend([""] * bottom_pad)
+    frame.append(_hint_bar("any key to continue"))
+    return frame
+
+
+def run_notice_screen(system, title, lines):
+    """Show a message card in the TUI and wait for a keypress — used for
+    errors raised outside an action screen (e.g. privilege checks)."""
+    global _active_frame_renderer
+
+    def draw():
+        frame = _notice_frame(system, title, lines)
+        sys.stdout.write("\033[H\033[J")
+        sys.stdout.write("\n".join(frame) + "\n")
+        sys.stdout.flush()
+
+    _active_frame_renderer = draw
+    _install_resize_handler()
+    _install_suspend_handler()
+    _raw_enter()
+    draw()
+    try:
+        _getch()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _raw_leave()
+        _active_frame_renderer = None
+        _restore_default_signals()
 
 
 def interactive_menu():
@@ -1261,22 +1570,28 @@ def interactive_menu():
             input(_c("\n  Press Enter to continue...", C.DIM))
         return
 
-    while True:
-        state = detect_existing_install(system)
-        options = build_options(state)
-        choice = run_menu_screen(system, state, options)
+    # Full-screen TUI: one continuous alt-buffer session. Menu, custom
+    # path input, uninstall confirmation, and action screens all render
+    # inside the TUI — the shell prompt only returns after Exit.
+    _buffer_enter()
+    try:
+        while True:
+            state = detect_existing_install(system)
+            options = build_options(state)
+            choice = run_menu_screen(system, state, options, persistent=True)
 
-        if choice == "exit":
-            log("Bye 👋")
-            break
+            if choice == "exit":
+                break
 
-        try:
-            dispatch_choice(system, choice, state)
-        except PrivilegeError as e:
-            error(str(e))
-        except Exception as e:
-            error(f"Unexpected error: {e}")
-        input(_c("\n  Press Enter to return to the menu...", C.DIM))
+            try:
+                dispatch_choice(system, choice, state, tui=True)
+            except PrivilegeError as e:
+                run_notice_screen(system, "Permission required", [str(e)])
+            except Exception as e:
+                run_notice_screen(system, "Unexpected error", [str(e)])
+    finally:
+        _buffer_leave()
+    log("Bye 👋")
 
 
 # ----------------------------------------------------------------------
