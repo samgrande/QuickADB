@@ -659,6 +659,25 @@ def unlink_linux():
 # ----------------------------------------------------------------------
 # Core actions
 # ----------------------------------------------------------------------
+def _fix_windows_permissions(path):
+    """The install directory is built inside a temp folder first, then
+    shutil.move()'d into place — which on Windows is just a rename, so it
+    does NOT recalculate inherited permissions from the new parent. Since
+    that temp folder belongs to the elevated installer process, the moved
+    directory can end up effectively admin-only, leaving normal user
+    accounts unable to even list it (let alone run adb from it) — even
+    though the system PATH and the file itself are perfectly fine. This
+    resets the ACL so it inherits normally from its parent, the same way
+    a folder created directly under C:\\ would behave."""
+    try:
+        subprocess.run(
+            ["icacls", path, "/reset", "/T", "/Q"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except Exception as e:
+        warn(f"Could not reset permissions on {path}: {e}")
+
+
 def do_install(system, target_dir):
     require_privileges(system)
 
@@ -673,6 +692,9 @@ def do_install(system, target_dir):
         parent = os.path.dirname(target_dir) or "."
         os.makedirs(parent, exist_ok=True)
         shutil.move(extracted, target_dir)
+
+    if system == "Windows":
+        _fix_windows_permissions(target_dir)
 
     success(f"Installed platform-tools to {target_dir}")
 
