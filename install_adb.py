@@ -1029,18 +1029,66 @@ def dispatch_choice(system, choice, state, tui=False):
             log("Cancelled.")
 
 
-def _menu_header(cols, rows):
-    """Small 'QuickADB' ascii-art wordmark with a 'Quick ADB by HeX'
-    title line beneath it — the compact header shared by every full-screen
-    frame. Shown whenever the terminal is big enough; on tiny terminals it
-    degrades to just the plain title line so the card is never clipped."""
+def _menu_header_lines(cols, variant):
+    """Build one header variant (already centered to `cols`):
+      - 'full'  → tiny QuickADB wordmark + 'Quick ADB by HeX' + divider
+      - 'art'   → wordmark + title
+      - 'title' → just the title line
+    The wordmark is small enough to never wrap, and every variant fits in
+    narrow terminals so the header is always visible at the top."""
     title = f"{C.DROID}{C.BOLD}Quick ADB{C.RESET}  {C.DIM}by HeX{C.RESET}" if USE_COLOR else "Quick ADB  by HeX"
-    if cols >= LOGO_TINY_W + 2 and rows >= 22:
+    if variant == "full":
         lines = [_ctr(_c(l, f"{C.DROID}{C.BOLD}"), cols) for l in LOGO_TINY]
         lines.append(_ctr(title, cols))
         lines.append(_ctr(_c("─" * (LOGO_TINY_W - 10), C.DROID_DIM), cols))
         return lines
+    if variant == "art":
+        lines = [_ctr(_c(l, f"{C.DROID}{C.BOLD}"), cols) for l in LOGO_TINY]
+        lines.append(_ctr(title, cols))
+        return lines
     return [_ctr(title, cols)]
+
+
+def _compose_frame(cols, rows, content, footer_text=None):
+    """Assemble a full-height frame that fits the terminal *exactly* so it
+    never scrolls: a header chosen from the largest variant that fits,
+    the card `content` vertically centered in the leftover space, and an
+    optional footer hint. The header always stays at the top; when the
+    terminal is too short for everything, the footer is dropped first and
+    then the card is trimmed from the bottom — never the header."""
+    for name, h in (("full", 5), ("art", 4), ("title", 1)):
+        for with_footer in (True, False):
+            if h + len(content) + (1 if with_footer else 0) <= rows:
+                header = _menu_header_lines(cols, name)
+                footer = [_hint_bar(footer_text)] if footer_text and with_footer else []
+                extra = max(rows - len(header) - len(footer) - len(content), 0)
+                top_pad = extra // 2
+                bottom_pad = extra - top_pad
+                lines = list(header)
+                lines.extend([""] * top_pad)
+                lines.extend(content)
+                lines.extend([""] * bottom_pad)
+                lines.extend(footer)
+                return lines
+    # Even the title + full card don't fit: keep the title, trim the card.
+    header = _menu_header_lines(cols, "title")
+    if len(header) + len(content) > rows:
+        content = content[: max(rows - len(header), 0)]
+    lines = list(header)
+    lines.extend(content)
+    return lines
+
+
+def _draw_frame(frame, rows=None):
+    """Paint a frame into the alt buffer without ever triggering a scroll.
+    Writes exactly `rows` lines with no trailing newline, so the header
+    pinned to the top of the frame always stays on screen."""
+    if rows is None:
+        rows = screen_height()
+    lines = frame[:rows]
+    sys.stdout.write("\033[H\033[J")
+    sys.stdout.write("\n".join(lines))
+    sys.stdout.flush()
 
 
 def _hint_bar(hint):
@@ -1056,7 +1104,6 @@ def _hint_bar(hint):
 
 def _menu_frame(system, state, options, idx):
     cols, rows = screen_width(), screen_height()
-    header = _menu_header(cols, rows)
     w = _card_width(cols)
 
     body = [_card_top(w)]
@@ -1074,20 +1121,8 @@ def _menu_frame(system, state, options, idx):
     body.append(_card_bottom(w))
 
     content = [_ctr(l, cols) for l in body]
-
-    # Fill the full terminal height: header + content, vertically
-    # centered in whatever's left + footer (1), pinned to the very bottom.
-    available = max(rows - len(header) - 1, 1)
-    extra = max(available - len(content), 0)
-    top_pad = extra // 2
-    bottom_pad = extra - top_pad
-
-    lines = list(header)
-    lines.extend([""] * top_pad)
-    lines.extend(content)
-    lines.extend([""] * bottom_pad)
-    lines.append(_hint_bar("↑/k ↓/j move   ↵ select   1-9 jump   q/⎋ quit"))
-    return lines
+    return _compose_frame(cols, rows, content,
+                          footer_text="↑/k ↓/j move   ↵ select   1-9 jump   q/⎋ quit")
 
 
 def _action_frame(system, title, done):
@@ -1096,7 +1131,6 @@ def _action_frame(system, title, done):
     activity log — all centered, all inside the same rounded card style
     as the menu screen."""
     cols, rows = screen_width(), screen_height()
-    header = _menu_header(cols, rows)
     w = _card_width(cols)
     inner_w = max(w - 4, 1)
 
@@ -1124,19 +1158,8 @@ def _action_frame(system, title, done):
     body.append(_card_bottom(w))
 
     content = [_ctr(l, cols) for l in body]
-
-    available = max(rows - len(header) - 1, 1)
-    extra = max(available - len(content), 0)
-    top_pad = extra // 2
-    bottom_pad = extra - top_pad
-
-    lines = list(header)
-    lines.extend([""] * top_pad)
-    lines.extend(content)
-    lines.extend([""] * bottom_pad)
     hint = "any key to continue" if done else "please wait..."
-    lines.append(_hint_bar(hint))
-    return lines
+    return _compose_frame(cols, rows, content, footer_text=hint)
 
 
 def run_action_screen(system, title, action_fn, persistent=False):
@@ -1155,9 +1178,7 @@ def run_action_screen(system, title, action_fn, persistent=False):
 
     def draw(done=False):
         frame = _action_frame(system, title, done)
-        sys.stdout.write("\033[H\033[J")
-        sys.stdout.write("\n".join(frame) + "\n")
-        sys.stdout.flush()
+        _draw_frame(frame)
 
     if not persistent:
         _buffer_enter()
@@ -1277,9 +1298,7 @@ def run_menu_screen(system, state, options, persistent=False):
 
     def draw():
         frame = _menu_frame(system, state, options, idx)
-        sys.stdout.write("\033[H\033[J")
-        sys.stdout.write("\n".join(frame) + "\n")
-        sys.stdout.flush()
+        _draw_frame(frame)
 
     if not persistent:
         _buffer_enter()
@@ -1336,7 +1355,6 @@ def _input_field_row(value, cursor, w):
 
 def _input_frame(system, title, prompt, value, cursor):
     cols, rows = screen_width(), screen_height()
-    header = _menu_header(cols, rows)
     w = _card_width(cols)
 
     body = [_card_top(w)]
@@ -1350,17 +1368,8 @@ def _input_frame(system, title, prompt, value, cursor):
     body.append(_card_bottom(w))
 
     content = [_ctr(l, cols) for l in body]
-    available = max(rows - len(header) - 1, 1)
-    extra = max(available - len(content), 0)
-    top_pad = extra // 2
-    bottom_pad = extra - top_pad
-
-    lines = list(header)
-    lines.extend([""] * top_pad)
-    lines.extend(content)
-    lines.extend([""] * bottom_pad)
-    lines.append(_hint_bar("type to edit   ←/→ move   ↵ confirm   ⎋ cancel"))
-    return lines
+    return _compose_frame(cols, rows, content,
+                          footer_text="type to edit   ←/→ move   ↵ confirm   ⎋ cancel")
 
 
 def run_input_screen(system, title, prompt, initial=""):
@@ -1372,9 +1381,7 @@ def run_input_screen(system, title, prompt, initial=""):
 
     def draw():
         frame = _input_frame(system, title, prompt, "".join(buf), cursor)
-        sys.stdout.write("\033[H\033[J")
-        sys.stdout.write("\n".join(frame) + "\n")
-        sys.stdout.flush()
+        _draw_frame(frame)
 
     _active_frame_renderer = draw
     _install_resize_handler()
@@ -1412,7 +1419,6 @@ def run_input_screen(system, title, prompt, initial=""):
 
 def _confirm_frame(system, prompt, idx):
     cols, rows = screen_width(), screen_height()
-    header = _menu_header(cols, rows)
     w = _card_width(cols)
     options = [("no", "No, cancel"), ("yes", "Yes, continue")]
 
@@ -1428,17 +1434,8 @@ def _confirm_frame(system, prompt, idx):
     body.append(_card_bottom(w))
 
     content = [_ctr(l, cols) for l in body]
-    available = max(rows - len(header) - 1, 1)
-    extra = max(available - len(content), 0)
-    top_pad = extra // 2
-    bottom_pad = extra - top_pad
-
-    lines = list(header)
-    lines.extend([""] * top_pad)
-    lines.extend(content)
-    lines.extend([""] * bottom_pad)
-    lines.append(_hint_bar("↑/k ↓/j move   ↵ select   ⎋ cancel"))
-    return lines
+    return _compose_frame(cols, rows, content,
+                          footer_text="↑/k ↓/j move   ↵ select   ⎋ cancel")
 
 
 def run_confirm_screen(system, prompt):
@@ -1451,9 +1448,7 @@ def run_confirm_screen(system, prompt):
 
     def draw():
         frame = _confirm_frame(system, prompt, idx)
-        sys.stdout.write("\033[H\033[J")
-        sys.stdout.write("\n".join(frame) + "\n")
-        sys.stdout.flush()
+        _draw_frame(frame)
 
     _active_frame_renderer = draw
     _install_resize_handler()
@@ -1480,7 +1475,6 @@ def run_confirm_screen(system, prompt):
 
 def _notice_frame(system, title, lines):
     cols, rows = screen_width(), screen_height()
-    header = _menu_header(cols, rows)
     w = _card_width(cols)
 
     body = [_card_top(w)]
@@ -1493,17 +1487,7 @@ def _notice_frame(system, title, lines):
     body.append(_card_bottom(w))
 
     content = [_ctr(l, cols) for l in body]
-    available = max(rows - len(header) - 1, 1)
-    extra = max(available - len(content), 0)
-    top_pad = extra // 2
-    bottom_pad = extra - top_pad
-
-    frame = list(header)
-    frame.extend([""] * top_pad)
-    frame.extend(content)
-    frame.extend([""] * bottom_pad)
-    frame.append(_hint_bar("any key to continue"))
-    return frame
+    return _compose_frame(cols, rows, content, footer_text="any key to continue")
 
 
 def run_notice_screen(system, title, lines):
@@ -1513,9 +1497,7 @@ def run_notice_screen(system, title, lines):
 
     def draw():
         frame = _notice_frame(system, title, lines)
-        sys.stdout.write("\033[H\033[J")
-        sys.stdout.write("\n".join(frame) + "\n")
-        sys.stdout.flush()
+        _draw_frame(frame)
 
     _active_frame_renderer = draw
     _install_resize_handler()
