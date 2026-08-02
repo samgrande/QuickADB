@@ -124,6 +124,13 @@ LOGO_MEDIUM = [
 ]
 LOGO_MEDIUM_W = max(len(l) for l in LOGO_MEDIUM)
 
+LOGO_TINY = [
+    "█▀█ █ █ █▀█ █▀▀ █▀▄ █▀█ █▀▄ █▀▄",
+    "█▄█ █ █  █  █   █▄▀ █▄█ █ █ █▄▀",
+    "▀▄▀ ▀▄▀ █▀█ █▄▄ █ ▀ █ █ █▄▀ █▄▀",
+]
+LOGO_TINY_W = max(len(l) for l in LOGO_TINY)
+
 LOGO_TAGLINE = "system-wide adb / fastboot installer"
 LOGO_BYLINE = "by HeX"
 LOGO_TOP_MARGIN = 1  # blank lines above the logo — bump this to push it down further
@@ -1022,16 +1029,18 @@ def dispatch_choice(system, choice, state, tui=False):
             log("Cancelled.")
 
 
-def _title_bar():
-    """Reverse-video header strip, full terminal width edge-to-edge —
-    chrome distinct from content via a solid color block."""
-    w = screen_width()
-    left = " 🤖 QUICK ADB"
-    right = "by HeX "
-    fill = max(w - len(left) - len(right), 1)
-    if USE_COLOR:
-        return f"{C.DROID_BG}{C.BLACK}{C.BOLD}{left}{C.RESET}{C.DROID_BG}{' ' * fill}{right}{C.RESET}"
-    return left + " " * fill + right
+def _menu_header(cols, rows):
+    """Small 'QuickADB' ascii-art wordmark with a 'Quick ADB by HeX'
+    title line beneath it — the compact header shared by every full-screen
+    frame. Shown whenever the terminal is big enough; on tiny terminals it
+    degrades to just the plain title line so the card is never clipped."""
+    title = f"{C.DROID}{C.BOLD}Quick ADB{C.RESET}  {C.DIM}by HeX{C.RESET}" if USE_COLOR else "Quick ADB  by HeX"
+    if cols >= LOGO_TINY_W + 2 and rows >= 22:
+        lines = [_ctr(_c(l, f"{C.DROID}{C.BOLD}"), cols) for l in LOGO_TINY]
+        lines.append(_ctr(title, cols))
+        lines.append(_ctr(_c("─" * (LOGO_TINY_W - 10), C.DROID_DIM), cols))
+        return lines
+    return [_ctr(title, cols)]
 
 
 def _hint_bar(hint):
@@ -1043,14 +1052,6 @@ def _hint_bar(hint):
     if USE_COLOR:
         return f"{C.SURFACE}{C.SURFACE_TEXT}{text}{' ' * pad}{C.RESET}"
     return text + " " * pad
-
-
-def _menu_header(cols, rows):
-    """Simple banner strip pinned to the top of every full-screen frame
-    (menu, action, input, confirm, notice) — always just the title bar, so
-    the card below it is never pushed off or clipped regardless of how
-    small the terminal is."""
-    return [_title_bar()]
 
 
 def _menu_frame(system, state, options, idx):
