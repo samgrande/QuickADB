@@ -1030,43 +1030,58 @@ def dispatch_choice(system, choice, state, tui=False):
 
 
 def _menu_header_lines(cols, variant):
-    """Build one header variant (already centered to `cols`):
-      - 'full'  → tiny QuickADB wordmark + 'Quick ADB by HeX' + divider
-      - 'art'   → wordmark + title
+    """Build one header variant (already centered to `cols`), tried in
+    order from most to least spacious so the header always fits without
+    ever forcing the screen to scroll:
+      - 'big'   → full block-letter ascii logo + tagline/byline
+                  (None if the terminal is too narrow for any art tier)
+      - 'full'  → tiny QuickADB wordmark + 'Quick ADB by HeX'
+      - 'art'   → tiny wordmark + title
       - 'title' → just the title line
-    The wordmark is small enough to never wrap, and every variant fits in
-    narrow terminals so the header is always visible at the top."""
+    LOGO_TOP_MARGIN blank lines are added above the 'big'/'full'/'art'
+    variants (skipped for the bare 'title' fallback, which only shows up
+    when the terminal is too short to spare the room)."""
     title = f"{C.DROID}{C.BOLD}Quick ADB{C.RESET}  {C.DIM}by HeX{C.RESET}" if USE_COLOR else "Quick ADB  by HeX"
+    margin = [""] * LOGO_TOP_MARGIN
+    if variant == "big":
+        logo = logo_block(cols)
+        if not logo:
+            return None
+        art_lines, art_count = logo
+        lines = colorize_logo(art_lines, art_count)
+        return margin + lines
     if variant == "full":
         lines = [_ctr(_c(l, f"{C.DROID}{C.BOLD}"), cols) for l in LOGO_TINY]
         lines.append(_ctr(title, cols))
-        lines.append(_ctr(_c("─" * (LOGO_TINY_W - 10), C.DROID_DIM), cols))
-        return lines
+        return margin + lines
     if variant == "art":
         lines = [_ctr(_c(l, f"{C.DROID}{C.BOLD}"), cols) for l in LOGO_TINY]
         lines.append(_ctr(title, cols))
-        return lines
+        return margin + lines
     return [_ctr(title, cols)]
 
 
 def _compose_frame(cols, rows, content, footer_text=None):
     """Assemble a full-height frame that fits the terminal *exactly* so it
     never scrolls: a header chosen from the largest variant that fits,
-    the card `content` vertically centered in the leftover space, and an
-    optional footer hint. The header always stays at the top; when the
-    terminal is too short for everything, the footer is dropped first and
-    then the card is trimmed from the bottom — never the header."""
-    for name, h in (("full", 5), ("art", 4), ("title", 1)):
+    sitting directly above the card, with the two treated as one block
+    and vertically centered together — plus an optional footer hint. When
+    the terminal is too short for everything, the footer is dropped
+    first, then the header falls back to a smaller variant, and only
+    then is the card trimmed from the bottom."""
+    for name in ("big", "full", "art", "title"):
+        header = _menu_header_lines(cols, name)
+        if header is None:
+            continue
         for with_footer in (True, False):
-            if h + len(content) + (1 if with_footer else 0) <= rows:
-                header = _menu_header_lines(cols, name)
+            if len(header) + len(content) + (1 if with_footer else 0) <= rows:
                 footer = [_hint_bar(footer_text)] if footer_text and with_footer else []
-                extra = max(rows - len(header) - len(footer) - len(content), 0)
+                block = list(header) + list(content)
+                extra = max(rows - len(block) - len(footer), 0)
                 top_pad = extra // 2
                 bottom_pad = extra - top_pad
-                lines = list(header)
-                lines.extend([""] * top_pad)
-                lines.extend(content)
+                lines = [""] * top_pad
+                lines.extend(block)
                 lines.extend([""] * bottom_pad)
                 lines.extend(footer)
                 return lines
@@ -1082,12 +1097,19 @@ def _compose_frame(cols, rows, content, footer_text=None):
 def _draw_frame(frame, rows=None):
     """Paint a frame into the alt buffer without ever triggering a scroll.
     Writes exactly `rows` lines with no trailing newline, so the header
-    pinned to the top of the frame always stays on screen."""
+    pinned to the top of the frame always stays on screen.
+
+    Uses \\r\\n (not just \\n) between lines: the TUI runs with the
+    terminal in raw mode (needed so _getch() can read arrow keys), and
+    raw mode disables the terminal's automatic CR-on-LF translation. A
+    bare \\n there only moves the cursor down a row without returning it
+    to column 0, so every other line would render starting from wherever
+    the previous line happened to end — this is what makes it."""
     if rows is None:
         rows = screen_height()
     lines = frame[:rows]
     sys.stdout.write("\033[H\033[J")
-    sys.stdout.write("\n".join(lines))
+    sys.stdout.write("\r\n".join(lines))
     sys.stdout.flush()
 
 
